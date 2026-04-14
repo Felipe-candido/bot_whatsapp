@@ -1,12 +1,10 @@
 const { Client } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
+require('dotenv').config();
 
 const client = new Client();
 
-const numeros = [
-  '5519990019866@c.us',
-  '5519999948769@c.us'
-];
+const numeros = JSON.parse(process.env.NUMEROS)
 
 const mensagens = [
   "Bom dia! Identificamos um débito em aberto na ESC Araras. Como você prefere regularizar?",
