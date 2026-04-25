@@ -1,0 +1,5 @@
+{
+  "watch": ["index.js", "src"],
+  "ext": "js,json",
+  "ignore": ["sessions/**", "bot.db", "bot.db-*"]
+}

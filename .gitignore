@@ -1,3 +1,6 @@
 node_modules/
 .wwebjs_cache/
 .env
+sessions/
+bot.db
+bot.db-*
