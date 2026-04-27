@@ -1,7 +1,7 @@
 const fs = require('fs')
 const path = require('path')
 const pino = require('pino')
-const qrcode = require('qrcode-terminal')
+const qrcode = require('qrcode')
 
 const { handleIncomingMessages } = require('./messageHandler')
 
@@ -12,6 +12,12 @@ let sock = null
 let connectPromise = null
 let reconnectTimer = null
 let baileysModulePromise = null
+let currentQR = null
+let connectionStatus = 'connecting' // connecting | open | close
+
+function getStatus() {
+  return connectionStatus
+}
 
 function ensureSessionDir() {
   fs.mkdirSync(SESSION_DIR, { recursive: true })
@@ -101,19 +107,27 @@ async function createSocketConnection() {
     }
   })
 
-  nextSock.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
+  nextSock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
     if (qr) {
-      console.log('\nEscaneie o QR Code abaixo:\n')
-      qrcode.generate(qr, { small: true })
+      try {
+        currentQR = await qrcode.toDataURL(qr)
+        connectionStatus = 'connecting'
+        console.log('QR Code atualizado')
+      } catch (err) {
+        console.error('Erro ao gerar QR:', err)
+      }
     }
 
     if (connection === 'open') {
+      connectionStatus = 'open'
+      currentQR = null
       clearReconnectTimer()
       console.log('WhatsApp conectado com sucesso')
       return
     }
 
     if (connection !== 'close') {
+      connectionStatus = 'close'
       return
     }
 
@@ -129,8 +143,24 @@ async function createSocketConnection() {
     }
 
     if (loggedOut) {
-      clearReconnectTimer()
-      console.log('Sessao invalida. Apague a pasta sessions/ e rode novamente.')
+      console.log('Sessao invalida. Limpando sessao...')
+
+      try {
+        fs.rmSync(SESSION_DIR, { recursive: true, force: true })
+      } catch (err) {
+        console.error('Erro ao limpar sessao:', err)
+      }
+
+      sock = null
+      currentQR = null
+      connectionStatus = 'close'
+
+      setTimeout(() => {
+        connectToWhatsApp().catch(err => {
+          console.error('Erro ao reconectar:', err)
+        })
+      }, 2000)
+
       return
     }
 
@@ -156,4 +186,9 @@ function getSock() {
   return sock
 }
 
-module.exports = { connectToWhatsApp, getSock }
+function getQR() {
+  return currentQR
+}
+
+
+module.exports = { connectToWhatsApp, getSock, getQR, getStatus }
