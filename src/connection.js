@@ -13,57 +13,61 @@ let connectPromise = null
 let reconnectTimer = null
 let baileysModulePromise = null
 let currentQR = null
-let connectionStatus = 'connecting' // connecting | open | close
+let connectionStatus = 'connecting'
 
 function getStatus() {
   return connectionStatus
 }
 
+// garante pasta
 function ensureSessionDir() {
-  fs.mkdirSync(SESSION_DIR, { recursive: true })
+  if (!fs.existsSync(SESSION_DIR)) {
+    fs.mkdirSync(SESSION_DIR, { recursive: true })
+  }
+}
+
+// limpa arquivos (sem deletar a pasta)
+function clearSessionFiles() {
+  if (!fs.existsSync(SESSION_DIR)) return
+
+  for (const file of fs.readdirSync(SESSION_DIR)) {
+    const filePath = path.join(SESSION_DIR, file)
+
+    try {
+      fs.rmSync(filePath, { recursive: true, force: true })
+    } catch (err) {
+      console.error('[ERRO] Falha ao remover arquivo:', filePath)
+    }
+  }
 }
 
 async function loadBaileys() {
   if (!baileysModulePromise) {
     baileysModulePromise = import('@whiskeysockets/baileys')
   }
-
   return baileysModulePromise
 }
 
 function clearReconnectTimer() {
-  if (!reconnectTimer) {
-    return
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer)
+    reconnectTimer = null
   }
-
-  clearTimeout(reconnectTimer)
-  reconnectTimer = null
 }
 
 function scheduleReconnect() {
-  if (reconnectTimer || connectPromise || sock) {
-    return
-  }
+  if (reconnectTimer || connectPromise || sock) return
 
-  console.log(`Tentando reconectar em ${RECONNECT_DELAY_MS / 1000} segundos...`)
+  console.log(`Reconectando em ${RECONNECT_DELAY_MS / 1000}s...`)
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null
-    connectToWhatsApp().catch(err => {
-      console.error('[ERRO] Falha ao reconectar ao WhatsApp:', err)
-    })
+    connectToWhatsApp().catch(console.error)
   }, RECONNECT_DELAY_MS)
 }
 
 async function connectToWhatsApp() {
-  if (sock) {
-    console.log('Ja existe uma conexao ativa.')
-    return sock
-  }
-
-  if (connectPromise) {
-    console.log('Conexao com WhatsApp em andamento...')
-    return connectPromise
-  }
+  if (sock) return sock
+  if (connectPromise) return connectPromise
 
   connectPromise = createSocketConnection().finally(() => {
     connectPromise = null
@@ -99,67 +103,53 @@ async function createSocketConnection() {
   sock = nextSock
   clearReconnectTimer()
 
-  nextSock.ev.on('creds.update', async () => {
-    try {
-      await saveCreds()
-    } catch (err) {
-      console.error('[ERRO] Falha ao salvar credenciais:', err)
-    }
-  })
+  nextSock.ev.on('creds.update', saveCreds)
 
   nextSock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
+
     if (qr) {
-      try {
-        currentQR = await qrcode.toDataURL(qr)
-        connectionStatus = 'connecting'
-        console.log('QR Code atualizado')
-      } catch (err) {
-        console.error('Erro ao gerar QR:', err)
-      }
+      currentQR = await qrcode.toDataURL(qr)
+      connectionStatus = 'connecting'
+      console.log('QR atualizado')
     }
 
     if (connection === 'open') {
       connectionStatus = 'open'
       currentQR = null
-      clearReconnectTimer()
-      console.log('WhatsApp conectado com sucesso')
+      console.log('WhatsApp conectado')
       return
     }
 
-    if (connection !== 'close') {
-      connectionStatus = 'close'
-      return
-    }
+    if (connection !== 'close') return
 
     const code =
       lastDisconnect?.error?.output?.statusCode ||
       lastDisconnect?.error?.statusCode
+
     const loggedOut = code === DisconnectReason.loggedOut
 
-    console.log(`Conexao fechada (codigo: ${code || 'desconhecido'})`)
+    console.log(`Conexao fechada (${code})`)
 
-    if (sock === nextSock) {
-      sock = null
-    }
+    // 🔥 mata socket antes de mexer em arquivo
+    try {
+      nextSock.ws.close()
+    } catch {}
+
+    sock = null
 
     if (loggedOut) {
-      console.log('Sessao invalida. Limpando sessao...')
+      console.log('Sessao invalida → resetando arquivos')
 
-      try {
-        fs.rmSync(SESSION_DIR, { recursive: true, force: true })
-      } catch (err) {
-        console.error('Erro ao limpar sessao:', err)
-      }
-
-      sock = null
-      currentQR = null
-      connectionStatus = 'close'
-
+      // 🔥 espera um pouco pro Windows largar o lock
       setTimeout(() => {
-        connectToWhatsApp().catch(err => {
-          console.error('Erro ao reconectar:', err)
-        })
-      }, 2000)
+        clearSessionFiles()
+        ensureSessionDir()
+
+        currentQR = null
+        connectionStatus = 'connecting'
+
+        connectToWhatsApp().catch(console.error)
+      }, 1500)
 
       return
     }
@@ -168,14 +158,12 @@ async function createSocketConnection() {
   })
 
   nextSock.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') {
-      return
-    }
+    if (type !== 'notify') return
 
     try {
       await handleIncomingMessages(nextSock, messages)
     } catch (err) {
-      console.error('[ERRO] Falha ao processar mensagens:', err)
+      console.error('[ERRO] mensagens:', err)
     }
   })
 
@@ -190,5 +178,9 @@ function getQR() {
   return currentQR
 }
 
-
-module.exports = { connectToWhatsApp, getSock, getQR, getStatus }
+module.exports = {
+  connectToWhatsApp,
+  getSock,
+  getQR,
+  getStatus
+}
