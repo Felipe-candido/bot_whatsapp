@@ -130,7 +130,7 @@ async function createSocketConnection() {
 
     console.log(`Conexao fechada (${code})`)
 
-    // 🔥 mata socket antes de mexer em arquivo
+    // mata socket antes de mexer em arquivo
     try {
       nextSock.ws.close()
     } catch {}
@@ -140,7 +140,7 @@ async function createSocketConnection() {
     if (loggedOut) {
       console.log('Sessao invalida → resetando arquivos')
 
-      // 🔥 espera um pouco pro Windows largar o lock
+      // espera um pouco pro Windows largar o lock
       setTimeout(() => {
         clearSessionFiles()
         ensureSessionDir()

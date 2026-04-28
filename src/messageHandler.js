@@ -2,21 +2,18 @@ const { STATES, getState, setState } = require('./stateManager')
 const { sendMsg, sendImage, normalize } = require('./helpers')
 const { saveCity, saveFormField } = require('./database')
 
-// TRIGGER EXATO (somente essa mensagem ativa o bot)
+// TRIGGER DO ANÚNCIO (controlado, mas não frágil)
 function isAdTrigger(rawText) {
-  const clean = rawText
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '') // remove acento
-    .replace(/[^\w\s]/g, '') // remove pontuação
-    .trim()
+  const expected = normalize(
+    'Olá! Tenho interesse e queria mais informações, por favor.'
+  )
 
-  const expected = 'ola tenho interesse e queria mais informacoes por favor'
+  const incoming = normalize(rawText)
 
-  return clean === expected
+  return incoming === expected
 }
 
-// 👍 respostas positivas
+// respostas positivas
 function isPositive(text) {
   return /^(sim+|ss+|ok+|quero+|bora+|claro+|pode)/i.test(text)
 }
@@ -84,20 +81,29 @@ async function handleIncomingMessages(sock, messages) {
     if (jid === 'status@broadcast') continue
 
     const rawText = getMessageText(msg.message)
+    if (!rawText.trim()) continue
+
     const text = normalize(rawText)
+
     const row = getState(jid)
     const state = row?.state || STATES.IDLE
 
     console.log(`[MSG] ${jid} | estado: ${state} | texto: "${rawText}"`)
 
-    // só entra se for a mensagem exata do anúncio
+
+    // entrada do fluxo
     if (state === STATES.IDLE) {
       if (!isAdTrigger(rawText)) {
         console.log(`[IGNORADO] ${jid} - nao veio do anuncio`)
         continue
       }
 
+      console.log("ENTROU NO TRIGGER")
+
       await sendWelcome(sock, jid)
+
+      // marca como lead válido
+      setState(jid, STATES.AWAITING_CITY)
       continue
     }
 
@@ -125,8 +131,6 @@ async function sendWelcome(sock, jid) {
       'Somos uma empresa de credito e estamos aqui para auxiliar com seu capital de giro.\n\n' +
       'Para comecar, informe em qual cidade voce possui comercio e qual o seu CNPJ.'
   })
-
-  setState(jid, STATES.AWAITING_CITY)
 }
 
 async function handleCity(sock, jid, text) {
