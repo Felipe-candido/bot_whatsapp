@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  bot:
+    build: .
+    container_name: bot_whatsapp
+    ports:
+      - "${PORT:-3000}:3000"
+    volumes:
+      # Sessão do WhatsApp (credenciais Baileys)
+      - ./data/sessions:/app/sessions
+      # Banco de dados SQLite
+      - ./data:/app/data
+      # Assets (imagens enviadas pelo bot)
+      - ./assets:/app/assets:ro
+    env_file:
+      - .env
+    environment:
+      - DATA_DIR=/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3000/', r => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s

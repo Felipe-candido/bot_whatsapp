@@ -5,38 +5,42 @@ const qrcode = require('qrcode')
 
 const { handleIncomingMessages } = require('./messageHandler')
 
-const SESSION_DIR = path.resolve(__dirname, '..', 'sessions')
-const RECONNECT_DELAY_MS = 3000
+const DATA_DIR = process.env.DATA_DIR || path.resolve(__dirname, '..')
+const SESSION_DIR = path.resolve(DATA_DIR, '..', 'sessions')
+
+// SESSION_DIR aponta para o volume: /app/sessions (via Docker) ou ../sessions (local)
+const SESSION_PATH = process.env.DATA_DIR
+  ? path.join(process.env.DATA_DIR, '..', 'sessions')
+  : path.resolve(__dirname, '..', 'sessions')
+
+const RECONNECT_DELAY_MS = 5000
+const MAX_RECONNECT_ATTEMPTS = 10
 
 let sock = null
 let connectPromise = null
 let reconnectTimer = null
+let reconnectAttempts = 0
 let baileysModulePromise = null
 let currentQR = null
-let connectionStatus = 'connecting'
+let connectionStatus = 'disconnected'
 
-function getStatus() {
-  return connectionStatus
-}
+function getStatus() { return connectionStatus }
+function getQR() { return currentQR }
 
-// garante pasta
 function ensureSessionDir() {
-  if (!fs.existsSync(SESSION_DIR)) {
-    fs.mkdirSync(SESSION_DIR, { recursive: true })
+  if (!fs.existsSync(SESSION_PATH)) {
+    fs.mkdirSync(SESSION_PATH, { recursive: true })
   }
 }
 
-// limpa arquivos (sem deletar a pasta)
 function clearSessionFiles() {
-  if (!fs.existsSync(SESSION_DIR)) return
-
-  for (const file of fs.readdirSync(SESSION_DIR)) {
-    const filePath = path.join(SESSION_DIR, file)
-
+  if (!fs.existsSync(SESSION_PATH)) return
+  for (const file of fs.readdirSync(SESSION_PATH)) {
+    const filePath = path.join(SESSION_PATH, file)
     try {
       fs.rmSync(filePath, { recursive: true, force: true })
     } catch (err) {
-      console.error('[ERRO] Falha ao remover arquivo:', filePath)
+      console.error('[ERRO] Falha ao remover arquivo de sessao:', filePath, err.message)
     }
   }
 }
@@ -55,18 +59,54 @@ function clearReconnectTimer() {
   }
 }
 
-function scheduleReconnect() {
-  if (reconnectTimer || connectPromise || sock) return
+function scheduleReconnect(forceDelay) {
+  // Não agenda se já há tentativa em andamento
+  if (reconnectTimer || connectPromise) return
 
-  console.log(`Reconectando em ${RECONNECT_DELAY_MS / 1000}s...`)
+  if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+    console.error('[ERRO] Numero maximo de tentativas de reconexao atingido. Reinicie o servico.')
+    connectionStatus = 'disconnected'
+    return
+  }
+
+  // Backoff exponencial com limite de 60s
+  const delay = forceDelay || Math.min(
+    RECONNECT_DELAY_MS * Math.pow(1.5, reconnectAttempts),
+    60000
+  )
+
+  reconnectAttempts++
+  console.log(`[RECONEXAO] Tentativa ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS} em ${Math.round(delay / 1000)}s...`)
+
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null
-    connectToWhatsApp().catch(console.error)
-  }, RECONNECT_DELAY_MS)
+    connectToWhatsApp().catch(err => {
+      console.error('[ERRO] Falha na reconexao:', err.message)
+      scheduleReconnect()
+    })
+  }, delay)
+}
+
+/**
+ * Fecha o socket atual de forma segura, sem lançar exceções.
+ */
+function closeSockSafely(s) {
+  if (!s) return
+  try {
+    // Baileys expõe ws como WebSocket — fecha só se ainda estiver aberto
+    if (s.ws && typeof s.ws.close === 'function') {
+      s.ws.close()
+    }
+  } catch {
+    // ignora
+  }
 }
 
 async function connectToWhatsApp() {
-  if (sock) return sock
+  // Se já existe um socket ABERTO, retorna ele
+  if (sock && connectionStatus === 'open') return sock
+
+  // Se há uma promessa de conexão em andamento, aguarda ela
   if (connectPromise) return connectPromise
 
   connectPromise = createSocketConnection().finally(() => {
@@ -84,20 +124,35 @@ async function createSocketConnection() {
     default: makeWASocket,
     useMultiFileAuthState,
     DisconnectReason,
-    fetchLatestBaileysVersion
+    fetchLatestBaileysVersion,
+    makeCacheableSignalKeyStore
   } = baileys
 
-  const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR)
-  const { version } = await fetchLatestBaileysVersion()
+  const { state, saveCreds } = await useMultiFileAuthState(SESSION_PATH)
+  const { version, isLatest } = await fetchLatestBaileysVersion()
 
-  console.log(`Usando Baileys versao: ${version.join('.')}`)
+  console.log(`[BAILEYS] Versao: ${version.join('.')} | Ultima: ${isLatest}`)
+
+  connectionStatus = 'connecting'
+  currentQR = null
 
   const nextSock = makeWASocket({
     version,
-    auth: state,
+    auth: {
+      creds: state.creds,
+      keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' }))
+    },
     logger: pino({ level: 'silent' }),
     browser: ['Bot Credito', 'Chrome', '1.0.0'],
-    getMessage: async () => undefined
+    // Necessário para Baileys reenviar mensagens que precisam de retry
+    getMessage: async key => {
+      // Retorna undefined é válido — significa que não temos o histórico da mensagem
+      // Baileys vai pedir para o remetente reenviar se necessário
+      return undefined
+    },
+    // Recebe mensagens em modo offline (enviadas enquanto desconectado)
+    syncFullHistory: false,
+    markOnlineOnConnect: false
   })
 
   sock = nextSock
@@ -105,82 +160,88 @@ async function createSocketConnection() {
 
   nextSock.ev.on('creds.update', saveCreds)
 
-  nextSock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
+  nextSock.ev.on('connection.update', async (update) => {
+    const { connection, lastDisconnect, qr } = update
 
     if (qr) {
-      currentQR = await qrcode.toDataURL(qr)
-      connectionStatus = 'connecting'
-      console.log('QR atualizado')
+      try {
+        currentQR = await qrcode.toDataURL(qr)
+        connectionStatus = 'connecting'
+        console.log('[QR] Novo QR Code gerado — escaneie pelo WhatsApp')
+      } catch (err) {
+        console.error('[ERRO] Falha ao gerar QR Code:', err.message)
+      }
     }
 
     if (connection === 'open') {
       connectionStatus = 'open'
       currentQR = null
-      console.log('WhatsApp conectado')
+      reconnectAttempts = 0 // reset contador ao conectar com sucesso
+      console.log('[CONEXAO] WhatsApp conectado com sucesso')
+      return
+    }
+
+    if (connection === 'connecting') {
+      connectionStatus = 'connecting'
       return
     }
 
     if (connection !== 'close') return
 
-    const code =
+    const statusCode =
       lastDisconnect?.error?.output?.statusCode ||
       lastDisconnect?.error?.statusCode
 
-    const loggedOut = code === DisconnectReason.loggedOut
+    const { loggedOut, connectionClosed, timedOut, badSession } = DisconnectReason
 
-    console.log(`Conexao fechada (${code})`)
+    const isLoggedOut  = statusCode === loggedOut
+    const isBadSession = statusCode === badSession
+    const isTimedOut   = statusCode === timedOut
 
-    // mata socket antes de mexer em arquivo
-    try {
-      nextSock.ws.close()
-    } catch {}
+    console.log(`[CONEXAO] Fechada — codigo: ${statusCode}`)
 
-    sock = null
+    closeSockSafely(nextSock)
 
-    if (loggedOut) {
-      console.log('Sessao invalida → resetando arquivos')
+    // Só zera sock se ainda aponta para este socket
+    if (sock === nextSock) sock = null
 
-      // espera um pouco pro Windows largar o lock
+    connectionStatus = 'disconnected'
+
+    if (isLoggedOut || isBadSession) {
+      console.log('[SESSAO] Sessao invalida ou deslogada — limpando arquivos e gerando novo QR')
+
       setTimeout(() => {
         clearSessionFiles()
         ensureSessionDir()
-
         currentQR = null
+        reconnectAttempts = 0
         connectionStatus = 'connecting'
-
         connectToWhatsApp().catch(console.error)
-      }, 1500)
+      }, 2000)
 
       return
     }
 
-    scheduleReconnect()
+    // Para qualquer outro erro, reagenda com backoff
+    scheduleReconnect(isTimedOut ? 2000 : undefined)
   })
 
   nextSock.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') return
+    // 'notify'  = mensagens novas recebidas em tempo real
+    // 'append'  = mensagens sincronizadas do histórico após reconexão
+    // Processamos ambos, mas a deduplicação no DB evita responder duas vezes
+    if (type !== 'notify' && type !== 'append') return
 
     try {
-      await handleIncomingMessages(nextSock, messages)
+      await handleIncomingMessages(nextSock, messages, type)
     } catch (err) {
-      console.error('[ERRO] mensagens:', err)
+      console.error('[ERRO] Falha ao processar mensagens:', err)
     }
   })
 
   return nextSock
 }
 
-function getSock() {
-  return sock
-}
+function getSock() { return sock }
 
-function getQR() {
-  return currentQR
-}
-
-module.exports = {
-  connectToWhatsApp,
-  getSock,
-  getQR,
-  getStatus
-}
+module.exports = { connectToWhatsApp, getSock, getQR, getStatus }
