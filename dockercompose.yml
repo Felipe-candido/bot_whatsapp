@@ -7,20 +7,24 @@ services:
     ports:
       - "${PORT:-3000}:3000"
     volumes:
-      # Sessão do WhatsApp (credenciais Baileys)
-      - ./data/sessions:/app/sessions
-      # Banco de dados SQLite
+      # Banco SQLite (estados, leads, fichas de todos os tenants)
       - ./data:/app/data
-      # Assets (imagens enviadas pelo bot)
+      # Sessoes WhatsApp — um subdiretorio por tenant (sessions/vendas1/, sessions/num2/, ...)
+      - ./sessions:/app/sessions
+      # Assets do bot (imagens enviadas, somente leitura)
       - ./assets:/app/assets:ro
-    env_file:
-      - .env
     environment:
+      - PORT=3000
       - DATA_DIR=/app/data
+      - SESSIONS_DIR=/app/sessions
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3000/', r => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"]
+      test:
+        - CMD
+        - node
+        - -e
+        - "require('http').get('http://localhost:3000/',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 15s
+      start_period: 20s

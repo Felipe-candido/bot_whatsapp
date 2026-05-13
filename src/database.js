@@ -1,9 +1,8 @@
 const path = require('path')
 const Database = require('better-sqlite3')
 
-// Usa DATA_DIR do ambiente (Docker volume) ou pasta raiz do projeto
 const DATA_DIR = process.env.DATA_DIR || path.resolve(__dirname, '..')
-const DB_PATH = path.join(DATA_DIR, 'bot.db')
+const DB_PATH  = path.join(DATA_DIR, 'bot.db')
 
 let db
 
@@ -16,48 +15,72 @@ function initDb() {
   db.pragma('synchronous = NORMAL')
 
   db.exec(`
+    CREATE TABLE IF NOT EXISTS tenants (
+      id         TEXT PRIMARY KEY,
+      label      TEXT NOT NULL DEFAULT '',
+      active     INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
     CREATE TABLE IF NOT EXISTS user_state (
-      phone       TEXT PRIMARY KEY,
-      state       TEXT NOT NULL DEFAULT 'idle',
-      form_step   INTEGER DEFAULT 0,
-      updated_at  TEXT
+      tenant_id  TEXT NOT NULL DEFAULT 'default',
+      phone      TEXT NOT NULL,
+      state      TEXT NOT NULL DEFAULT 'idle',
+      form_step  INTEGER DEFAULT 0,
+      updated_at TEXT,
+      PRIMARY KEY (tenant_id, phone)
     );
 
     CREATE TABLE IF NOT EXISTS leads (
-      id          INTEGER PRIMARY KEY AUTOINCREMENT,
-      phone       TEXT UNIQUE NOT NULL,
-      city_cnpj   TEXT,
-      source      TEXT DEFAULT 'anuncio',
-      created_at  TEXT DEFAULT (datetime('now'))
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      tenant_id  TEXT NOT NULL DEFAULT 'default',
+      phone      TEXT NOT NULL,
+      city_cnpj  TEXT,
+      source     TEXT DEFAULT 'anuncio',
+      created_at TEXT DEFAULT (datetime('now')),
+      UNIQUE(tenant_id, phone)
     );
 
     CREATE TABLE IF NOT EXISTS form_fields (
-      id          INTEGER PRIMARY KEY AUTOINCREMENT,
-      phone       TEXT NOT NULL,
-      field_name  TEXT NOT NULL,
-      value       TEXT,
-      saved_at    TEXT DEFAULT (datetime('now')),
-      UNIQUE(phone, field_name)
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      tenant_id  TEXT NOT NULL DEFAULT 'default',
+      phone      TEXT NOT NULL,
+      field_name TEXT NOT NULL,
+      value      TEXT,
+      saved_at   TEXT DEFAULT (datetime('now')),
+      UNIQUE(tenant_id, phone, field_name)
     );
 
-    -- Deduplicação: evita processar a mesma mensagem duas vezes após reconexão
     CREATE TABLE IF NOT EXISTS processed_messages (
-      msg_id      TEXT PRIMARY KEY,
-      processed_at TEXT DEFAULT (datetime('now'))
+      tenant_id    TEXT NOT NULL DEFAULT 'default',
+      msg_id       TEXT NOT NULL,
+      processed_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (tenant_id, msg_id)
     );
 
-    -- Limpa mensagens processadas com mais de 24h para não crescer indefinidamente
-    CREATE INDEX IF NOT EXISTS idx_fields_phone ON form_fields(phone);
-    CREATE INDEX IF NOT EXISTS idx_processed_at ON processed_messages(processed_at);
+    CREATE INDEX IF NOT EXISTS idx_fields_tenant_phone
+      ON form_fields(tenant_id, phone);
+    CREATE INDEX IF NOT EXISTS idx_processed_at
+      ON processed_messages(processed_at);
   `)
 
-  // Limpa deduplicações antigas (> 24h) a cada inicialização
+  _migrateAddColumn('user_state',  'tenant_id', "TEXT NOT NULL DEFAULT 'default'")
+  _migrateAddColumn('leads',       'tenant_id', "TEXT NOT NULL DEFAULT 'default'")
+  _migrateAddColumn('form_fields', 'tenant_id', "TEXT NOT NULL DEFAULT 'default'")
+
   db.prepare(
     "DELETE FROM processed_messages WHERE processed_at < datetime('now', '-1 day')"
   ).run()
 
-  console.log(`Banco de dados iniciado (${DB_PATH})`)
+  console.log(`[DB] Iniciado: ${DB_PATH}`)
   return db
+}
+
+function _migrateAddColumn(table, column, definition) {
+  try {
+    db.prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`).run()
+    console.log(`[DB] Migracao: ${table}.${column} adicionado`)
+  } catch { /* coluna ja existe */ }
 }
 
 function getDb() {
@@ -65,58 +88,107 @@ function getDb() {
   return db
 }
 
-/**
- * Registra uma mensagem como processada.
- * Retorna true se for nova (deve processar), false se já foi vista (duplicata).
- */
-function markMessageProcessed(msgId) {
+// ─── Tenants ──────────────────────────────────────────────────────────────────
+
+function addTenant(id, label = '') {
+  getDb().prepare(`
+    INSERT INTO tenants (id, label) VALUES (?, ?)
+    ON CONFLICT(id) DO UPDATE SET label = excluded.label, active = 1
+  `).run(id, label)
+}
+
+function deactivateTenant(id) {
+  getDb().prepare('UPDATE tenants SET active = 0 WHERE id = ?').run(id)
+}
+
+function getTenant(id) {
+  return getDb().prepare('SELECT * FROM tenants WHERE id = ?').get(id)
+}
+
+function getAllTenants() {
+  return getDb().prepare('SELECT * FROM tenants ORDER BY created_at ASC').all()
+}
+
+function getActiveTenants() {
+  return getDb().prepare(
+    'SELECT * FROM tenants WHERE active = 1 ORDER BY created_at ASC'
+  ).all()
+}
+
+// ─── Deduplicacao ─────────────────────────────────────────────────────────────
+
+function markMessageProcessed(tenantId, msgId) {
   try {
     getDb().prepare(
-      'INSERT INTO processed_messages (msg_id) VALUES (?)'
-    ).run(msgId)
-    return true // nova
+      'INSERT INTO processed_messages (tenant_id, msg_id) VALUES (?, ?)'
+    ).run(tenantId, msgId)
+    return true
   } catch {
-    return false // já existia (UNIQUE constraint)
+    return false // ja processada
   }
 }
 
-function saveCity(phone, cityCnpj) {
-  getDb().prepare(`
-    INSERT INTO leads (phone, city_cnpj)
-    VALUES (?, ?)
-    ON CONFLICT(phone) DO UPDATE SET city_cnpj = excluded.city_cnpj
-  `).run(phone, cityCnpj)
+// ─── Estado do usuario ────────────────────────────────────────────────────────
+
+function getState(tenantId, phone) {
+  return getDb().prepare(
+    'SELECT * FROM user_state WHERE tenant_id = ? AND phone = ?'
+  ).get(tenantId, phone)
 }
 
-function saveFormField(phone, field, value) {
+function setState(tenantId, phone, state, formStep = 0) {
   getDb().prepare(`
-    INSERT INTO form_fields (phone, field_name, value)
+    INSERT INTO user_state (tenant_id, phone, state, form_step, updated_at)
+    VALUES (?, ?, ?, ?, datetime('now'))
+    ON CONFLICT(tenant_id, phone) DO UPDATE SET
+      state      = excluded.state,
+      form_step  = excluded.form_step,
+      updated_at = excluded.updated_at
+  `).run(tenantId, phone, state, formStep)
+}
+
+// ─── Leads e fichas ───────────────────────────────────────────────────────────
+
+function saveCity(tenantId, phone, cityCnpj) {
+  getDb().prepare(`
+    INSERT INTO leads (tenant_id, phone, city_cnpj)
     VALUES (?, ?, ?)
-    ON CONFLICT(phone, field_name) DO UPDATE SET
+    ON CONFLICT(tenant_id, phone) DO UPDATE SET city_cnpj = excluded.city_cnpj
+  `).run(tenantId, phone, cityCnpj)
+}
+
+function saveFormField(tenantId, phone, field, value) {
+  getDb().prepare(`
+    INSERT INTO form_fields (tenant_id, phone, field_name, value)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(tenant_id, phone, field_name) DO UPDATE SET
       value    = excluded.value,
       saved_at = datetime('now')
-  `).run(phone, field, value)
+  `).run(tenantId, phone, field, value)
 }
 
-function getFormData(phone) {
+function getFormData(tenantId, phone) {
   const rows = getDb().prepare(
-    'SELECT field_name, value FROM form_fields WHERE phone = ?'
-  ).all(phone)
+    'SELECT field_name, value FROM form_fields WHERE tenant_id = ? AND phone = ?'
+  ).all(tenantId, phone)
   return Object.fromEntries(rows.map(r => [r.field_name, r.value]))
 }
 
-function getAllLeads() {
+function getAllLeads(tenantId) {
+  if (tenantId) {
+    return getDb().prepare(
+      'SELECT * FROM leads WHERE tenant_id = ? ORDER BY created_at DESC'
+    ).all(tenantId)
+  }
   return getDb().prepare(
-    'SELECT * FROM leads ORDER BY created_at DESC'
+    'SELECT * FROM leads ORDER BY tenant_id, created_at DESC'
   ).all()
 }
 
 module.exports = {
-  initDb,
-  getDb,
-  saveCity,
-  saveFormField,
-  getFormData,
-  getAllLeads,
-  markMessageProcessed
+  initDb, getDb,
+  addTenant, deactivateTenant, getTenant, getAllTenants, getActiveTenants,
+  markMessageProcessed,
+  getState, setState,
+  saveCity, saveFormField, getFormData, getAllLeads
 }

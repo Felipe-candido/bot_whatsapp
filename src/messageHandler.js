@@ -1,8 +1,11 @@
-const { STATES, getState, setState } = require('./stateManager')
+const { STATES } = require('./stateManager')
+const {
+  getState, setState,
+  saveCity, saveFormField,
+  markMessageProcessed
+} = require('./database')
 const { sendMsg, sendImage, normalize } = require('./helpers')
-const { saveCity, saveFormField, markMessageProcessed } = require('./database')
 
-// TRIGGER DO ANÚNCIO
 function isAdTrigger(rawText) {
   const expected = normalize(
     'Olá! Tenho interesse e queria mais informações, por favor.'
@@ -10,7 +13,6 @@ function isAdTrigger(rawText) {
   return normalize(rawText) === expected
 }
 
-// Respostas positivas
 function isPositive(text) {
   return /^(sim+|ss+|ok+|quero+|bora+|claro+|pode)/i.test(text)
 }
@@ -69,21 +71,21 @@ function getMessageText(message = {}) {
   )
 }
 
-/**
- * Extrai um ID único para deduplicação.
- * Combina o ID da mensagem com o JID do remetente para ser globalmente único.
- */
 function getMessageId(msg) {
-  const id  = msg?.key?.id || ''
-  const jid = msg?.key?.remoteJid || ''
-  return `${jid}:${id}`
+  return `${msg?.key?.remoteJid}:${msg?.key?.id}`
 }
 
-async function handleIncomingMessages(sock, messages, type = 'notify') {
+/**
+ * Processa mensagens recebidas para um tenant especifico.
+ * @param {string}  tenantId  - identificador do numero WhatsApp
+ * @param {object}  sock      - socket Baileys do tenant
+ * @param {Array}   messages  - lista de mensagens
+ * @param {string}  type      - 'notify' | 'append'
+ */
+async function handleIncomingMessages(tenantId, sock, messages, type = 'notify') {
   for (const msg of messages) {
     const jid = msg?.key?.remoteJid
 
-    // Filtros básicos
     if (!jid) continue
     if (msg.key.fromMe) continue
     if (jid.endsWith('@g.us')) continue
@@ -92,61 +94,56 @@ async function handleIncomingMessages(sock, messages, type = 'notify') {
     const rawText = getMessageText(msg.message)
     if (!rawText.trim()) continue
 
-    // Deduplicação: ignora mensagens que já foram processadas (replay após reconexão)
-    const msgId = getMessageId(msg)
-    const isNew = markMessageProcessed(msgId)
+    // Deduplicacao: ignora replays pos-reconexao
+    const isNew = markMessageProcessed(tenantId, getMessageId(msg))
     if (!isNew) {
-      console.log(`[DEDUP] Mensagem ignorada (ja processada): ${msgId}`)
+      console.log(`[${tenantId}] [DEDUP] Mensagem ignorada (ja processada)`)
       continue
     }
 
-    // Para mensagens do histórico (append), só processa se o usuário já tem estado ativo
-    // Evita responder a mensagens muito antigas do histórico de sync
+    // Para mensagens do historico (append), so processa usuarios com estado ativo
     if (type === 'append') {
-      const row = getState(jid)
+      const row = getState(tenantId, jid)
       if (!row || row.state === STATES.IDLE) {
-        console.log(`[APPEND] Mensagem historica ignorada para jid sem estado ativo: ${jid}`)
+        console.log(`[${tenantId}] [APPEND] Historico ignorado para estado idle: ${jid}`)
         continue
       }
     }
 
-    const text = normalize(rawText)
-    const row  = getState(jid)
+    const text  = normalize(rawText)
+    const row   = getState(tenantId, jid)
     const state = row?.state || STATES.IDLE
 
-    console.log(`[MSG] ${jid} | tipo: ${type} | estado: ${state} | texto: "${rawText.slice(0, 80)}"`)
+    console.log(`[${tenantId}] ${jid} | estado: ${state} | "${rawText.slice(0, 80)}"`)
 
     try {
-      // Entrada do fluxo
       if (state === STATES.IDLE) {
         if (!isAdTrigger(rawText)) {
-          console.log(`[IGNORADO] ${jid} - mensagem nao veio do anuncio`)
+          console.log(`[${tenantId}] [IGNORADO] nao veio do anuncio: ${jid}`)
           continue
         }
-
         await sendWelcome(sock, jid)
-        setState(jid, STATES.AWAITING_CITY)
+        setState(tenantId, jid, STATES.AWAITING_CITY)
         continue
       }
 
       if (state === STATES.AWAITING_CITY) {
-        await handleCity(sock, jid, rawText)
+        await handleCity(tenantId, sock, jid, rawText)
         continue
       }
 
       if (state === STATES.AWAITING_FICHA) {
-        await handleConfirm(sock, jid, text)
+        await handleConfirm(tenantId, sock, jid, text)
         continue
       }
 
       if (state === STATES.COMPLETED) {
-        // Salva qualquer mensagem enviada após o formulário (fotos, dados extras)
-        await saveFormField(jid, `ficha_${Date.now()}`, rawText)
+        await saveFormField(tenantId, jid, `ficha_${Date.now()}`, rawText)
         continue
       }
 
     } catch (err) {
-      console.error(`[ERRO] Falha ao processar mensagem de ${jid}:`, err)
+      console.error(`[${tenantId}] Erro ao processar msg de ${jid}:`, err)
     }
   }
 }
@@ -160,26 +157,23 @@ async function sendWelcome(sock, jid) {
   })
 }
 
-async function handleCity(sock, jid, text) {
-  saveCity(jid, text)
-
+async function handleCity(tenantId, sock, jid, text) {
+  saveCity(tenantId, jid, text)
   await sendImage(sock, jid, 'assets/tabela_precos.jpg', 'Tabela de valores')
   await sendMsg(sock, jid, { text: EXAMPLE_TEXT }, 800)
-
-  setState(jid, STATES.AWAITING_FICHA)
+  setState(tenantId, jid, STATES.AWAITING_FICHA)
 }
 
-async function handleConfirm(sock, jid, text) {
+async function handleConfirm(tenantId, sock, jid, text) {
   if (!isPositive(text)) {
     await sendMsg(sock, jid, {
-      text: 'Sem problemas. Qualquer duvida estamos a disposicao.'
+      text: 'Qualquer duvida estamos a disposicao.'
     })
-    setState(jid, STATES.IDLE)
+    setState(tenantId, jid, STATES.IDLE)
     return
   }
-
   await sendMsg(sock, jid, { text: FULL_FORM })
-  setState(jid, STATES.COMPLETED)
+  setState(tenantId, jid, STATES.COMPLETED)
 }
 
 module.exports = { handleIncomingMessages }
